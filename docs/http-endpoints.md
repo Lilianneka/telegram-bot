@@ -233,6 +233,10 @@ mimir_telegram_consecutive_failures{network="testnet"} 0
 # HELP mimir_telegram_latest_ledger Highest ledger seen by the poller
 # TYPE mimir_telegram_latest_ledger gauge
 mimir_telegram_latest_ledger{network="testnet"} 5123456
+# HELP mimir_telegram_metric_samples_dropped_total Metric samples dropped before exposition, by bounded reason (invalid_number, unknown_label)
+# TYPE mimir_telegram_metric_samples_dropped_total counter
+mimir_telegram_metric_samples_dropped_total{network="testnet",reason="invalid_number"} 0
+mimir_telegram_metric_samples_dropped_total{network="testnet",reason="unknown_label"} 0
 
 # HELP mimir_telegram_target_last_event_ledger Highest ledger in which an event was processed for a target
 # TYPE mimir_telegram_target_last_event_ledger gauge
@@ -323,6 +327,7 @@ The metrics registry tracks:
 | `mimir_bot_notifications_failed_total` | counter | Telegram sends that threw (cursor still advanced) |
 | `mimir_bot_stale_cursor_events_total` | counter | Times a stale-cursor warning was emitted |
 | `mimir_bot_consecutive_failures` | gauge | Current consecutive full-cycle RPC failures (resets on success) |
+| `mimir_bot_metric_samples_dropped_total` | counter | Samples dropped before exposition, labelled by bounded `reason` (`invalid_number`, `unknown_label`); NaN/Infinity are never emitted |
 
 ```bash
 METRICS_PORT=9090  # in .env or environment

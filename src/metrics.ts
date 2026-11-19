@@ -21,6 +21,8 @@
  *   const { close } = await metrics.startServer(9090);
  *   // on shutdown:
  *   await close();
+ *
+ * Pass a validation failure reason to `metrics.droppedSamples.inc("<reason>")`.
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -33,6 +35,25 @@ export interface Counter {
   /** Current value. */
   value(): number;
 }
+
+/**
+ * Bounded-cardinality counter keyed by a fixed set of reason labels.
+ * Unknown labels are folded into `unknown` so Prometheus cardinality stays bounded.
+ */
+export interface LabeledCounter {
+  /** Increment the counter for `reason` (default 1). Unknown reasons map to "unknown". */
+  inc(reason: string, delta?: number): void;
+  /** Current value for a reason label. */
+  value(reason: string): number;
+}
+
+/** Fixed set of reasons a metric sample can be dropped. Bounded for cardinality safety. */
+export const DROP_REASONS = [
+  "invalid_number",
+  "unknown_label",
+] as const;
+
+export type DropReason = (typeof DROP_REASONS)[number];
 
 export interface Gauge {
   /** Set to `value`. */
@@ -89,6 +110,13 @@ export interface MetricsRegistry {
   /** Complete cycles classified as a spike or drop against the rolling
    *  activity baseline. */
   activityAnomalies: Counter;
+  /**
+   * Samples dropped before exposure, labelled by bounded reason
+   * (`invalid_number`, `unknown_label`, or `unknown`).
+   */
+  droppedSamples: LabeledCounter;
+  /** Record a numeric sample for a gauge; non-finite values are dropped and counted. */
+  setGaugeSafe(gauge: Gauge, value: number): void;
 
   /**
    * Render the registry as a Prometheus text exposition string.
@@ -146,6 +174,27 @@ function makeGauge(name: string, help: string): Gauge & { _name: string; _help: 
 
 const METRICS_PREFIX = "mimir_bot_";
 
+function makeLabeledCounter(name: string, help: string, labels: readonly string[]): LabeledCounter & { _name: string; _help: string; _labels: readonly string[]; _entries(): [string, number][] } {
+  const values = new Map<string, number>(labels.map((l) => [l, 0]));
+  const known = new Set<string>(labels);
+  return {
+    _name: name,
+    _help: help,
+    _labels: labels,
+    inc(reason: string, delta = 1): void {
+      if (delta < 0) throw new RangeError(`LabeledCounter.inc delta must be >= 0; got ${delta}`);
+      const key = known.has(reason) ? reason : "unknown";
+      values.set(key, (values.get(key) ?? 0) + delta);
+    },
+    value(reason: string): number {
+      return values.get(known.has(reason) ? reason : "unknown") ?? 0;
+    },
+    _entries(): [string, number][] {
+      return [...values.entries()];
+    },
+  };
+}
+
 export function createMetrics(): MetricsRegistry {
   const pollCycles = makeCounter(
     `${METRICS_PREFIX}poll_cycles_total`,
@@ -195,6 +244,11 @@ export function createMetrics(): MetricsRegistry {
     `${METRICS_PREFIX}activity_anomalies_total`,
     "Complete poll cycles classified as a spike or drop against the rolling activity baseline.",
   );
+  const droppedSamples = makeLabeledCounter(
+    `${METRICS_PREFIX}dropped_samples_total`,
+    "Metric samples dropped before exposure, by bounded reason.",
+    [...DROP_REASONS, "unknown"],
+  );
 
   const counters = [
     pollCycles,
@@ -216,6 +270,12 @@ export function createMetrics(): MetricsRegistry {
       lines.push(`# HELP ${c._name} ${c._help}`);
       lines.push(`# TYPE ${c._name} counter`);
       lines.push(`${c._name} ${c.value()}`);
+    }
+
+    lines.push(`# HELP ${droppedSamples._name} ${droppedSamples._help}`);
+    lines.push(`# TYPE ${droppedSamples._name} counter`);
+    for (const [reason, v] of droppedSamples._entries()) {
+      lines.push(`${droppedSamples._name}{reason="${reason}"} ${v}`);
     }
 
     for (const g of gauges) {
@@ -306,6 +366,14 @@ export function createMetrics(): MetricsRegistry {
     lastCycleEvents,
     activityBaselineEvents,
     activityAnomalies,
+    droppedSamples,
+    setGaugeSafe(gauge: Gauge, value: number): void {
+      if (!Number.isFinite(value)) {
+        droppedSamples.inc("invalid_number");
+        return;
+      }
+      gauge.set(value);
+    },
     render,
     startServer,
   };
