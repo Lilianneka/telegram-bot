@@ -19,6 +19,11 @@ export const STORE_VERSION = 1;
 
 export const DEFAULT_MAX_PER_CHAT = 50;
 
+/**
+ * Maximum number of follows a single chat may hold. Enforced by `FollowStore.follow`
+ * via `maxPerChat`; exposed here so command handlers can report the limit.
+ */
+
 export const DEFAULT_MAX_TOTAL = 5000;
 
 export class FollowStoreError extends Error {
