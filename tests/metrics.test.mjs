@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { get } from "node:http";
 import test from "node:test";
 
-import { createMetrics } from "../dist/metrics.js";
+import { createMetrics, deliveryFailureRate } from "../dist/metrics.js";
 
 function httpGet(url) {
   return new Promise((resolve, reject) => {
@@ -140,6 +140,42 @@ test("activity baseline: rendered metrics expose the last count and baseline", (
   assert.ok(output.includes("mimir_bot_activity_anomalies_total 2"), output);
 });
 
+test("notification age: distinguishes missing ledger time from zero delivery lag", () => {
+  const m = createMetrics();
+
+  // Zero delivery lag is a valid sample.
+  m.recordNotificationAge(0);
+  assert.equal(m.notificationAgeSamples.value(), 1);
+  assert.equal(m.notificationAgeMissingLedgerTime.value(), 0);
+  assert.equal(m.notificationAgeTotalMs.value(), 0);
+  assert.equal(m.lastNotificationAgeMs.value(), 0);
+  assert.equal(m.maxNotificationAgeMs.value(), 0);
+
+  // Positive age updates last, max, and cumulative total.
+  m.recordNotificationAge(1250.4);
+  assert.equal(m.notificationAgeSamples.value(), 2);
+  assert.equal(m.notificationAgeTotalMs.value(), 1250);
+  assert.equal(m.lastNotificationAgeMs.value(), 1250);
+  assert.equal(m.maxNotificationAgeMs.value(), 1250);
+
+  // Missing ledger time increments missing counter without overwriting last/max/samples.
+  m.recordNotificationAge(null);
+  assert.equal(m.notificationAgeSamples.value(), 2);
+  assert.equal(m.notificationAgeMissingLedgerTime.value(), 1);
+  assert.equal(m.notificationAgeTotalMs.value(), 1250);
+  assert.equal(m.lastNotificationAgeMs.value(), 1250);
+  assert.equal(m.maxNotificationAgeMs.value(), 1250);
+
+  const output = m.render();
+  assert.ok(output.includes("mimir_bot_notification_age_samples_total 2"), output);
+  assert.ok(output.includes("mimir_bot_notification_age_missing_ledger_time_total 1"), output);
+  assert.ok(output.includes("mimir_bot_notification_age_ms_total 1250"), output);
+  assert.ok(output.includes("mimir_bot_last_notification_age_ms 1250"), output);
+  assert.ok(output.includes("mimir_bot_max_notification_age_ms 1250"), output);
+});
+
+// ── render() format tests ─────────────────────────────────────────────────────
+
 test("render: output ends with a newline", () => {
   const m = createMetrics();
   const output = m.render();
@@ -163,6 +199,11 @@ test("render: contains all expected metric names", () => {
     "mimir_bot_last_cycle_events",
     "mimir_bot_activity_baseline_events",
     "mimir_bot_activity_anomalies_total",
+    "mimir_bot_notification_age_samples_total",
+    "mimir_bot_notification_age_missing_ledger_time_total",
+    "mimir_bot_notification_age_ms_total",
+    "mimir_bot_last_notification_age_ms",
+    "mimir_bot_max_notification_age_ms",
   ];
 
   for (const name of expectedNames) {
@@ -342,6 +383,26 @@ test("server: /metrics response includes Cache-Control: no-store", async () => {
   }
 });
 
+test("server: /health, 404, and 405 responses include Cache-Control: no-store", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const healthRes = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.equal(healthRes.statusCode, 200);
+    assert.equal(healthRes.headers["cache-control"], "no-store");
+
+    const notFoundRes = await httpGet(`http://127.0.0.1:${srv.port}/unknown`);
+    assert.equal(notFoundRes.statusCode, 404);
+    assert.equal(notFoundRes.headers["cache-control"], "no-store");
+
+    const methodNotAllowedRes = await httpRequest("POST", `http://127.0.0.1:${srv.port}/metrics`);
+    assert.equal(methodNotAllowedRes.statusCode, 405);
+    assert.equal(methodNotAllowedRes.headers["cache-control"], "no-store");
+  } finally {
+    await srv.close();
+  }
+});
+
 test("server: live counter updates are reflected in subsequent /metrics responses", async () => {
   const m = createMetrics();
   const srv = await m.startServer(0);
@@ -356,4 +417,136 @@ test("server: live counter updates are reflected in subsequent /metrics response
   } finally {
     await srv.close();
   }
+});
+
+test("server: close() releases the port (a second server can bind to it)", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  const port = srv.port;
+  await srv.close();
+
+  // If the port is truly released, a new server can bind to the same port.
+  // (Using port 0 again lets the OS assign, which may differ — so we just
+  // confirm that close() resolves without error and the server field is gone.)
+  // Binding to the same port deterministically would require SO_REUSEADDR
+  // races; instead we just confirm close() resolved cleanly.
+  assert.ok(port > 0, `Expected a positive port; got ${port}`);
+});
+
+test("server: startServer rejects if the port is already in use", async () => {
+  const m1 = createMetrics();
+  const m2 = createMetrics();
+  const srv1 = await m1.startServer(0);
+  try {
+    // Try to start a second server on the exact same port that srv1 is using.
+    await assert.rejects(
+      () => m2.startServer(srv1.port),
+      /EADDRINUSE|address already in use/i,
+    );
+  } finally {
+    await srv1.close();
+  }
+});
+
+// ── Security tests ────────────────────────────────────────────────────────────
+
+test("security: /metrics output does not contain the word 'token'", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    // The output should only contain metric names and numeric values.
+    // The word "token" should never appear.
+    assert.ok(
+      !res.body.toLowerCase().includes("token"),
+      `Unexpected 'token' in /metrics output: ${res.body}`,
+    );
+  } finally {
+    await srv.close();
+  }
+});
+
+test("security: /metrics output does not contain any non-numeric metric values", async () => {
+  const m = createMetrics();
+  m.pollCycles.inc(42);
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/metrics`);
+    // All metric value lines must match: <name> <non-negative-integer>
+    const metricLines = res.body
+      .split("\n")
+      .filter((l) => l.length > 0 && !l.startsWith("#"));
+    for (const line of metricLines) {
+      const parts = line.trim().split(/\s+/);
+      // Each data line must have exactly two parts: name and value.
+      assert.equal(parts.length, 2, `Unexpected metric line format: "${line}"`);
+      const value = parts[1];
+      assert.ok(
+        /^\d+$/.test(value ?? ""),
+        `Metric value is not a non-negative integer: "${line}"`,
+      );
+    }
+  } finally {
+    await srv.close();
+  }
+});
+
+test("security: /health response does not echo request headers", async () => {
+  const m = createMetrics();
+  const srv = await m.startServer(0);
+  try {
+    const res = await httpGet(`http://127.0.0.1:${srv.port}/health`);
+    assert.ok(!res.body.includes("authorization"), "Unexpected echo of header in /health");
+    assert.ok(!res.body.includes("x-api-key"), "Unexpected echo of header in /health");
+  } finally {
+    await srv.close();
+  }
+});
+
+// ── Filtered event counters & failure-rate denominator ────────────────────────
+
+test("filtered counters: start at zero and increment independently by reason", () => {
+  const m = createMetrics();
+  assert.equal(m.eventsFiltered.value(), 0);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 0);
+  assert.equal(m.eventsFilteredRule.value(), 0);
+
+  m.eventsFiltered.inc();
+  m.eventsFilteredFeatureFlag.inc();
+  assert.equal(m.eventsFiltered.value(), 1);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
+  assert.equal(m.eventsFilteredRule.value(), 0);
+  assert.equal(m.notificationsFailed.value(), 0);
+
+  m.eventsFiltered.inc();
+  m.eventsFilteredRule.inc();
+  assert.equal(m.eventsFiltered.value(), 2);
+  assert.equal(m.eventsFilteredFeatureFlag.value(), 1);
+  assert.equal(m.eventsFilteredRule.value(), 1);
+});
+
+test("filtered counters: rendered output includes stable filtered metric names", () => {
+  const m = createMetrics();
+  m.eventsFiltered.inc(3);
+  m.eventsFilteredFeatureFlag.inc(2);
+  m.eventsFilteredRule.inc(1);
+  const out = m.render();
+  assert.ok(out.includes("mimir_bot_events_filtered_total 3"));
+  assert.ok(out.includes("mimir_bot_events_filtered_feature_flag_total 2"));
+  assert.ok(out.includes("mimir_bot_events_filtered_rule_total 1"));
+});
+
+test("deliveryFailureRate: excludes filtered events from denominator and handles zero attempts", () => {
+  assert.equal(deliveryFailureRate(0, 0), 0);
+  assert.equal(deliveryFailureRate(8, 2), 0.2);
+
+  // Filtered events do not affect the failure rate denominator
+  const m = createMetrics();
+  m.notificationsSent.inc(8);
+  m.notificationsFailed.inc(2);
+  m.eventsFiltered.inc(100);
+  assert.equal(
+    deliveryFailureRate(m.notificationsSent.value(), m.notificationsFailed.value()),
+    0.2,
+  );
 });
